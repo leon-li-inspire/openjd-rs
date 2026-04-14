@@ -1,0 +1,26 @@
+[package]
+name = "openjd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Open Job Description CLI — validate, summarize, and run job templates"
+
+[[bin]]
+name = "openjd-rs"
+path = "src/main.rs"
+
+[dependencies]
+openjd-expr = { path = "../openjd-expr" }
+openjd-model = { path = "../openjd-model" }
+openjd-sessions = { path = "../openjd-sessions" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-util = "0.7"
+log = { version = "0.4", features = ["kv", "kv_std"] }
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

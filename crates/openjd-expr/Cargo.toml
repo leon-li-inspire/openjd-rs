@@ -1,0 +1,23 @@
+[package]
+name = "openjd-expr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Open Job Description expression language — types, evaluation, and path mapping"
+
+[dependencies]
+shlex = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Ruff Python parser for EXPR extension expression parsing.
+# The EXPR language is defined as a subset of Python expression syntax, and the
+# spec recommends the ruff parser for Rust implementations. It's the most actively
+# maintained Python parser in the Rust ecosystem (daily commits, backed by Astral).
+# Not published on crates.io, so we use a git dependency pinned to a commit.
+# See specs/parser-selection.md for the full evaluation.
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git", rev = "0cfec2268c5eb15949c9f822ef0018c987168883" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff.git", rev = "0cfec2268c5eb15949c9f822ef0018c987168883" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff.git", rev = "0cfec2268c5eb15949c9f822ef0018c987168883" }

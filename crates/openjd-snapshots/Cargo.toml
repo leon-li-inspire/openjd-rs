@@ -1,0 +1,58 @@
+[package]
+name = "openjd-snapshots"
+description = "Job attachments snapshot library for content-addressed file tree operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+glob = "0.3"
+walkdir = "2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
+tracing = { workspace = true }
+rayon = "1"
+aws-sdk-s3 = "1"
+aws-sdk-sts = "1"
+bytes = "1"
+async-trait = "0.1"
+futures-util = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"
+s3s = "0.13"
+s3s-fs = "0.13"
+s3s-aws = "0.13"
+aws-config = "1.8.15"
+
+[[bin]]
+name = "openjd-snapshots-bench"
+path = "src/bin/bench.rs"
+required-features = ["bench"]
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+optional = true
+
+[dependencies.rand]
+version = "0.8"
+optional = true
+
+[dependencies.tempfile]
+version = "3"
+optional = true
+
+[features]
+bench = ["clap", "rand", "tempfile"]

@@ -1,0 +1,299 @@
+use openjd_snapshots::{
+    collect_abs_snapshot, download_abs_manifest, hash_upload_abs_manifest, join_snapshot,
+    subtree_snapshot, AbsManifest, CollectOptions, AsyncDataCache, DownloadOptions,
+    FileEntry, FileSystemDataCache, HashCache, HashUploadOptions, HashAlgorithm, Manifest,
+    SymlinkPolicy, DEFAULT_FILE_CHUNK_SIZE,
+};
+use std::path::Path;
+use std::sync::Arc;
+use tempfile::TempDir;
+
+fn create_test_tree(dir: &Path) {
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("hello.txt"), b"hello world").unwrap();
+    std::fs::write(dir.join("sub/data.bin"), b"binary data here").unwrap();
+    std::fs::write(dir.join("empty.txt"), b"").unwrap();
+}
+
+fn upload_and_remap(
+    src_dir: &Path,
+    dst_dir: &Path,
+    data_cache: &Arc<FileSystemDataCache>,
+) -> openjd_snapshots::AbsSnapshot {
+    let snapshot = collect_abs_snapshot(
+        &[src_dir.to_path_buf()],
+        &[] as &[std::path::PathBuf],
+        CollectOptions::default(),
+    )
+    .unwrap();
+
+    let upload_result = hash_upload_abs_manifest(
+        &AbsManifest::Snapshot(snapshot),
+        data_cache.clone(),
+        HashUploadOptions::default(),
+    )
+    .unwrap();
+
+    let abs_snap = match upload_result.manifest {
+        AbsManifest::Snapshot(s) => s,
+        _ => panic!("expected snapshot"),
+    };
+
+    let rel = subtree_snapshot(
+        &abs_snap,
+        &src_dir.to_string_lossy(),
+        SymlinkPolicy::ExcludeAll,
+    )
+    .unwrap();
+    join_snapshot(&rel, &dst_dir.to_string_lossy()).unwrap()
+}
+
+#[test]
+fn round_trip_collect_upload_download() {
+    let src_dir = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let dst_dir = TempDir::new().unwrap();
+
+    create_test_tree(src_dir.path());
+
+    let data_cache = Arc::new(FileSystemDataCache::new(cache_dir.path().join("data")).unwrap());
+    let abs_dl = upload_and_remap(src_dir.path(), dst_dir.path(), &data_cache);
+
+    let download_result = download_abs_manifest(
+        &AbsManifest::Snapshot(abs_dl),
+        data_cache.clone() as Arc<dyn AsyncDataCache>,
+        DownloadOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(dst_dir.path().join("hello.txt")).unwrap(),
+        "hello world"
+    );
+    assert_eq!(
+        std::fs::read(dst_dir.path().join("sub/data.bin")).unwrap(),
+        b"binary data here"
+    );
+    assert_eq!(
+        std::fs::read(dst_dir.path().join("empty.txt")).unwrap(),
+        b""
+    );
+    assert_eq!(download_result.statistics.downloaded_files, 3);
+}
+
+#[test]
+fn upload_skip_on_second_run() {
+    let src_dir = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    std::fs::write(src_dir.path().join("a.txt"), b"aaa").unwrap();
+    std::fs::write(src_dir.path().join("b.txt"), b"bbb").unwrap();
+
+    let snapshot = collect_abs_snapshot(
+        &[src_dir.path().to_path_buf()],
+        &[] as &[std::path::PathBuf],
+        CollectOptions::default(),
+    )
+    .unwrap();
+
+    let data_cache = Arc::new(FileSystemDataCache::new(cache_dir.path().join("data")).unwrap());
+
+    let r1 = hash_upload_abs_manifest(
+        &AbsManifest::Snapshot(snapshot.clone()),
+        data_cache.clone() as Arc<dyn AsyncDataCache>,
+        HashUploadOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(r1.statistics.uploaded_files, 2);
+
+    let r2 = hash_upload_abs_manifest(
+        &AbsManifest::Snapshot(snapshot),
+        data_cache.clone() as Arc<dyn AsyncDataCache>,
+        HashUploadOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(r2.statistics.uploaded_files, 0);
+    assert_eq!(r2.statistics.skipped_files, 2);
+}
+
+#[test]
+fn download_skip_with_hash_cache() {
+    let src_dir = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let hc_dir = TempDir::new().unwrap();
+    let dst_dir = TempDir::new().unwrap();
+
+    std::fs::write(src_dir.path().join("file.txt"), b"content").unwrap();
+
+    let data_cache = Arc::new(FileSystemDataCache::new(cache_dir.path().join("data")).unwrap());
+    let hash_cache = Arc::new(HashCache::new(hc_dir.path()).unwrap());
+    let abs_dl = upload_and_remap(src_dir.path(), dst_dir.path(), &data_cache);
+
+    // First download
+    let r1 = download_abs_manifest(
+        &AbsManifest::Snapshot(abs_dl.clone()),
+        data_cache.clone() as Arc<dyn AsyncDataCache>,
+        DownloadOptions {
+            hash_cache: Some(hash_cache.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(r1.statistics.downloaded_files, 1);
+
+    // Second download - hash cache hit, should skip
+    let r2 = download_abs_manifest(
+        &AbsManifest::Snapshot(abs_dl),
+        data_cache.clone() as Arc<dyn AsyncDataCache>,
+        DownloadOptions {
+            hash_cache: Some(hash_cache),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(r2.statistics.skipped_files, 1);
+    assert_eq!(r2.statistics.downloaded_files, 0);
+}
+
+#[test]
+fn chunked_round_trip() {
+    let test_dir = Path::new("/shared/snapshot-testing");
+    std::fs::create_dir_all(test_dir).unwrap();
+    let src_dir = TempDir::new_in(test_dir).unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let dst_dir = TempDir::new().unwrap();
+
+    let data = (0..1024u16).map(|i| (i % 256) as u8).collect::<Vec<_>>();
+    std::fs::write(src_dir.path().join("big.bin"), &data).unwrap();
+
+    let chunk_size = 256i64;
+    let snapshot = collect_abs_snapshot(
+        &[src_dir.path().to_path_buf()],
+        &[] as &[std::path::PathBuf],
+        CollectOptions {
+            file_chunk_size_bytes: Some(chunk_size),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let data_cache = Arc::new(FileSystemDataCache::new(cache_dir.path().join("data")).unwrap());
+    let upload_result = hash_upload_abs_manifest(
+        &AbsManifest::Snapshot(snapshot),
+        data_cache.clone() as Arc<dyn AsyncDataCache>,
+        HashUploadOptions {
+            file_chunk_size_bytes: Some(chunk_size),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let abs_snap = match upload_result.manifest {
+        AbsManifest::Snapshot(s) => s,
+        _ => panic!(),
+    };
+    assert!(abs_snap.files[0].chunk_hashes.is_some());
+    assert_eq!(abs_snap.files[0].chunk_hashes.as_ref().unwrap().len(), 4);
+
+    let rel = subtree_snapshot(
+        &abs_snap,
+        &src_dir.path().to_string_lossy(),
+        SymlinkPolicy::ExcludeAll,
+    )
+    .unwrap();
+    let abs_dl = join_snapshot(&rel, &dst_dir.path().to_string_lossy()).unwrap();
+
+    download_abs_manifest(
+        &AbsManifest::Snapshot(abs_dl),
+        data_cache.clone() as Arc<dyn AsyncDataCache>,
+        DownloadOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(dst_dir.path().join("big.bin")).unwrap(), data);
+}
+
+#[test]
+fn delete_via_diff_manifest() {
+    let cache_dir = TempDir::new().unwrap();
+    let work_dir = TempDir::new().unwrap();
+
+    std::fs::write(work_dir.path().join("keep.txt"), b"keep").unwrap();
+    std::fs::write(work_dir.path().join("remove.txt"), b"gone").unwrap();
+    std::fs::create_dir(work_dir.path().join("empty_dir")).unwrap();
+
+    let data_cache = Arc::new(FileSystemDataCache::new(cache_dir.path().join("data")).unwrap());
+
+    let keep_hash = {
+        let h = openjd_snapshots::hash::hash_data(b"keep");
+        openjd_snapshots::ContentAddressedDataCache::put_object(&*data_cache, &h, "xxh128", b"keep").unwrap();
+        h
+    };
+
+    let keep_path = work_dir.path().join("keep.txt");
+    let remove_path = work_dir.path().join("remove.txt");
+
+    let mut keep_entry = FileEntry::file(keep_path.to_string_lossy().to_string(), 4, 1000);
+    keep_entry.hash = Some(keep_hash);
+
+    let diff: openjd_snapshots::AbsSnapshotDiff =
+        Manifest::new(HashAlgorithm::Xxh128, DEFAULT_FILE_CHUNK_SIZE)
+            .with_files(vec![
+                keep_entry,
+                FileEntry::deleted(remove_path.to_string_lossy().to_string()),
+            ])
+            .with_dirs(vec![openjd_snapshots::DirEntry {
+                path: work_dir
+                    .path()
+                    .join("empty_dir")
+                    .to_string_lossy()
+                    .to_string(),
+                deleted: true,
+            }]);
+
+    download_abs_manifest(
+        &AbsManifest::Diff(diff),
+        data_cache.clone() as Arc<dyn AsyncDataCache>,
+        DownloadOptions {
+            apply_deletes: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(keep_path.exists());
+    assert!(!remove_path.exists());
+    assert!(!work_dir.path().join("empty_dir").exists());
+}
+
+#[test]
+fn statistics_are_accurate() {
+    let src_dir = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+
+    std::fs::write(src_dir.path().join("a.txt"), b"aaaa").unwrap();
+    std::fs::write(src_dir.path().join("b.txt"), b"bb").unwrap();
+
+    let snapshot = collect_abs_snapshot(
+        &[src_dir.path().to_path_buf()],
+        &[] as &[std::path::PathBuf],
+        CollectOptions::default(),
+    )
+    .unwrap();
+
+    let data_cache = Arc::new(FileSystemDataCache::new(cache_dir.path().join("data")).unwrap());
+    let result = hash_upload_abs_manifest(
+        &AbsManifest::Snapshot(snapshot),
+        data_cache.clone() as Arc<dyn AsyncDataCache>,
+        HashUploadOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(result.statistics.total_files, 2);
+    assert_eq!(result.statistics.total_bytes, 6);
+    assert_eq!(result.statistics.hashed_files, 2);
+    assert_eq!(result.statistics.hashed_bytes, 6);
+    assert_eq!(result.statistics.uploaded_files, 2);
+    assert_eq!(result.statistics.uploaded_bytes, 6);
+    assert_eq!(result.statistics.skipped_files, 0);
+}

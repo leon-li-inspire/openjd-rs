@@ -1,0 +1,1445 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Tests for Session — mirrors Python test_session.py
+
+use openjd_sessions::action::ActionState;
+use openjd_sessions::session::{Session, SessionConfig, SessionState};
+use openjd_expr::format_string::FormatString;
+use openjd_model::job::{
+    Action, Environment, EnvironmentActions, EnvironmentScript,
+    StepScript, StepActions,
+};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tempfile::TempDir;
+
+fn fs(s: &str) -> FormatString { FormatString::new(s).unwrap() }
+
+fn action(cmd: &str, args: Vec<&str>) -> Action {
+    Action {
+        command: fs(cmd),
+        args: Some(args.iter().map(|a| fs(a)).collect()),
+        timeout: None, cancelation: None,
+    }
+}
+
+fn step(cmd: &str, args: Vec<&str>) -> StepScript {
+    StepScript {
+        let_bindings: None,
+        actions: StepActions { on_run: action(cmd, args) },
+        embedded_files: None,
+    }
+}
+
+fn env_with_enter(name: &str, cmd: &str, args: Vec<&str>) -> Environment {
+    Environment {
+        name: name.into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions { on_enter: Some(action(cmd, args)), on_exit: None },
+            embedded_files: None,
+        }),
+        variables: None,
+        resolved_symtab: None,
+    }
+}
+
+fn env_with_vars(name: &str, vars: HashMap<String, FormatString>) -> Environment {
+    Environment {
+        name: name.into(), description: None, script: None, variables: Some(vars),
+        resolved_symtab: None,
+    }
+}
+
+// === TestSessionInitialization ===
+
+#[tokio::test]
+async fn test_initialize_basic() {
+    let tmp = TempDir::new().unwrap();
+    let session = Session::new(tmp.path().to_path_buf());
+    assert_eq!(session.state(), SessionState::Ready);
+    assert!(session.working_directory().exists());
+}
+
+#[tokio::test]
+async fn test_initialize_with_root_dir() {
+    let tmp = TempDir::new().unwrap();
+    let session = Session::new(tmp.path().to_path_buf());
+    assert_eq!(session.working_directory(), tmp.path());
+}
+
+// === TestSessionRunTask_2023_09 ===
+
+#[tokio::test]
+async fn test_run_task() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let r = s.run_task(&step("sh", vec!["-c", "echo task_output"]), None, None, None).await.unwrap();
+    assert_eq!(r.state, ActionState::Success);
+    assert!(r.stdout.contains("task_output"));
+}
+
+#[tokio::test]
+async fn test_run_task_with_env_vars() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut vars = HashMap::new();
+    vars.insert("TASK_VAR".into(), fs("task_value"));
+    let env = env_with_vars("env1", vars);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo TASK_VAR=$TASK_VAR"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("TASK_VAR=task_value"));
+}
+
+#[tokio::test]
+async fn test_run_task_fail_run() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let r = s.run_task(&step("sh", vec!["-c", "exit 42"]), None, None, None).await.unwrap();
+    assert_eq!(r.state, ActionState::Failed);
+    assert_eq!(r.exit_code, Some(42));
+}
+
+#[tokio::test]
+async fn test_no_task_run_after_fail() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    // First run fails — session becomes "brittle" (ReadyEnding), only exit_environment allowed
+    s.run_task(&step("sh", vec!["-c", "exit 1"]), None, None, None).await.unwrap();
+    assert_eq!(s.state(), SessionState::ReadyEnding);
+}
+
+#[tokio::test]
+async fn test_run_task_with_variables() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut task_params = HashMap::new();
+    task_params.insert("Greeting".into(), openjd_model::types::TaskParameterValue {
+        param_type: openjd_model::types::TaskParameterType::String,
+        value: openjd_expr::ExprValue::String("hello".into()),
+    });
+
+    let script = StepScript {
+        let_bindings: None,
+        actions: StepActions {
+            on_run: Action {
+                command: fs("sh"),
+                args: Some(vec![fs("-c"), fs("echo {{ Task.Param.Greeting }}")]),
+                timeout: None, cancelation: None,
+            },
+        },
+        embedded_files: None,
+    };
+    let r = s.run_task(&script, Some(&task_params), None, None).await.unwrap();
+    assert!(r.stdout.contains("hello"));
+}
+
+// === TestSessionEnterEnvironment_2023_09 ===
+
+#[tokio::test]
+async fn test_enter_environment_basic() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "sh", vec!["-c", "echo entered"]);
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    assert!(!id.is_empty());
+}
+
+#[tokio::test]
+async fn test_enter_environment_with_env_vars() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut vars = HashMap::new();
+    vars.insert("ENV_VAR".into(), fs("env_value"));
+    let env = Environment {
+        name: "env1".into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions {
+                on_enter: Some(action("sh", vec!["-c", "echo ENV_VAR=$ENV_VAR"])),
+                on_exit: None,
+            },
+            embedded_files: None,
+        }),
+        variables: Some(vars),
+        resolved_symtab: None,
+    };
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    assert!(!id.is_empty());
+}
+
+#[tokio::test]
+async fn test_enter_two_environments() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env1 = env_with_enter("env1", "sh", vec!["-c", "echo 'openjd_env: FROM_ENV1=val1'"]);
+    let env2 = env_with_enter("env2", "sh", vec!["-c", "echo FROM_ENV1=$FROM_ENV1"]);
+    s.enter_environment(&env1, None, None, None).await.unwrap();
+    let id2 = s.enter_environment(&env2, None, None, None).await.unwrap();
+    assert!(!id2.is_empty());
+}
+
+#[tokio::test]
+async fn test_enter_environment_fail_run() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "sh", vec!["-c", "exit 1"]);
+    assert!(s.enter_environment(&env, None, None, None).await.is_err());
+}
+
+#[tokio::test]
+async fn test_enter_environment_command_not_found() {
+    // Regression: when the subprocess command doesn't exist, the session must
+    // transition to ReadyEnding with action_state=Failed, not stay stuck in Running.
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "nonexistent-command-xyz", vec![]);
+    let result = s.enter_environment(&env, None, None, None).await;
+    assert!(result.is_err());
+    assert_eq!(s.state(), SessionState::ReadyEnding);
+    let status = s.action_status().expect("action_status should be set after failure");
+    assert_eq!(status.state, ActionState::Failed);
+}
+
+#[tokio::test]
+async fn test_run_task_command_not_found() {
+    // Same regression test for run_task: command not found must set Failed state.
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let script = step("nonexistent-command-xyz", vec![]);
+    let result = s.run_task(&script, None, None, None).await;
+    assert!(result.is_err());
+    assert_eq!(s.state(), SessionState::ReadyEnding);
+    let status = s.action_status().expect("action_status should be set after failure");
+    assert_eq!(status.state, ActionState::Failed);
+}
+
+#[tokio::test]
+async fn test_enter_no_action() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = Environment {
+        name: "env1".into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions { on_enter: None, on_exit: None },
+            embedded_files: None,
+        }),
+        variables: None,
+        resolved_symtab: None,
+    };
+    assert!(s.enter_environment(&env, None, None, None).await.is_ok());
+}
+
+#[tokio::test]
+async fn test_enter_environment_with_resolved_variables() {
+    let tmp = TempDir::new().unwrap();
+    use openjd_model::types::JobParameterValue;
+    let mut job_params = HashMap::new();
+    job_params.insert("Val".to_string(), JobParameterValue {
+        param_type: openjd_model::types::JobParameterType::String,
+        value: openjd_expr::ExprValue::String("resolved".into()),
+    });
+    let session_config = openjd_sessions::session::SessionConfig {
+        session_id: "test".into(),
+        job_parameter_values: job_params,
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: None,
+        os_env_vars: None,
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    };
+    let mut s = Session::with_config(session_config).unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("RESOLVED".into(), fs("{{ Param.Val }}"));
+    let env = Environment {
+        name: "env1".into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions {
+                on_enter: Some(action("sh", vec!["-c", "echo RESOLVED=$RESOLVED"])),
+                on_exit: None,
+            },
+            embedded_files: None,
+        }),
+        variables: Some(vars),
+        resolved_symtab: None,
+    };
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    assert!(!id.is_empty());
+}
+
+// === TestSessionExitEnvironment_2023_09 ===
+
+#[tokio::test]
+async fn test_exit_environment_basic() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = Environment {
+        name: "env1".into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions {
+                on_enter: None,
+                on_exit: Some(action("sh", vec!["-c", "echo exited"])),
+            },
+            embedded_files: None,
+        }),
+        variables: None,
+        resolved_symtab: None,
+    };
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    let out = s.exit_environment(&id, None, true, None).await.unwrap();
+    assert!(out.contains("exited"));
+}
+
+#[tokio::test]
+async fn test_exit_environment_with_env_vars() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut vars = HashMap::new();
+    vars.insert("EXIT_VAR".into(), fs("exit_value"));
+    let env = Environment {
+        name: "env1".into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions {
+                on_enter: None,
+                on_exit: Some(action("sh", vec!["-c", "echo EXIT_VAR=$EXIT_VAR"])),
+            },
+            embedded_files: None,
+        }),
+        variables: Some(vars.clone()),
+        resolved_symtab: None,
+    };
+    // Enter first to set vars
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    let out = s.exit_environment(&id, None, true, None).await.unwrap();
+    assert!(out.contains("EXIT_VAR=exit_value"));
+}
+
+#[tokio::test]
+async fn test_exit_environment_removes_variables() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut vars = HashMap::new();
+    vars.insert("REMOVED_VAR".into(), fs("value"));
+    let env = env_with_vars("env1", vars);
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    s.exit_environment(&id, None, true, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo REMOVED_VAR=${REMOVED_VAR:-gone}"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("REMOVED_VAR=gone"));
+}
+
+#[tokio::test]
+async fn test_exit_environment_fail_run() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = Environment {
+        name: "env1".into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions { on_enter: None, on_exit: Some(action("sh", vec!["-c", "exit 1"])) },
+            embedded_files: None,
+        }),
+        variables: None,
+        resolved_symtab: None,
+    };
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    assert!(s.exit_environment(&id, None, true, None).await.is_err());
+}
+
+#[tokio::test]
+async fn test_run_task_after_env_exit() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "sh", vec!["-c", "echo 'openjd_env: PERSIST=yes'"]);
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    s.exit_environment(&id, None, true, None).await.unwrap();
+
+    // After exit, env vars set via openjd_env are removed along with the environment.
+    // Only process_env vars persist across environment exits.
+    let r = s.run_task(&step("sh", vec!["-c", "echo PERSIST=${PERSIST:-no}"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("PERSIST=no"));
+}
+
+// === TestEnvironmentVariablesInTasks_2023_09 ===
+
+#[tokio::test]
+async fn test_direct_definition() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut vars = HashMap::new();
+    vars.insert("DIRECT".into(), fs("direct_val"));
+    let env = env_with_vars("env1", vars);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo DIRECT=$DIRECT"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("DIRECT=direct_val"));
+}
+
+#[tokio::test]
+async fn test_redefinition_nested() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut vars1 = HashMap::new();
+    vars1.insert("VAR".into(), fs("outer"));
+    let env1 = env_with_vars("env1", vars1);
+    s.enter_environment(&env1, None, None, None).await.unwrap();
+
+    let mut vars2 = HashMap::new();
+    vars2.insert("VAR".into(), fs("inner"));
+    let env2 = env_with_vars("env2", vars2);
+    s.enter_environment(&env2, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo VAR=$VAR"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("VAR=inner"));
+}
+
+#[tokio::test]
+async fn test_def_via_stdout() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "sh", vec!["-c", "echo 'openjd_env: STDOUT_VAR=stdout_val'"]);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo STDOUT_VAR=$STDOUT_VAR"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("STDOUT_VAR=stdout_val"));
+}
+
+#[tokio::test]
+async fn test_def_via_stdout_overrides_direct() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut vars = HashMap::new();
+    vars.insert("OVERRIDE".into(), fs("direct"));
+    let env = Environment {
+        name: "env1".into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions {
+                on_enter: Some(action("sh", vec!["-c", "echo 'openjd_env: OVERRIDE=from_stdout'"])),
+                on_exit: None,
+            },
+            embedded_files: None,
+        }),
+        variables: Some(vars),
+        resolved_symtab: None,
+    };
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo OVERRIDE=$OVERRIDE"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("OVERRIDE=from_stdout"));
+}
+
+#[tokio::test]
+async fn test_undef_via_stdout() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env1 = env_with_enter("env1", "sh", vec!["-c", "echo 'openjd_env: TO_UNDEF=val'"]);
+    s.enter_environment(&env1, None, None, None).await.unwrap();
+
+    let env2 = env_with_enter("env2", "sh", vec!["-c", "echo 'openjd_unset_env: TO_UNDEF'"]);
+    s.enter_environment(&env2, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo TO_UNDEF=${TO_UNDEF:-gone}"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("TO_UNDEF=gone"));
+}
+
+#[tokio::test]
+async fn test_def_via_redacted_env_stdout() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf()).with_revision_extensions(openjd_model::types::ValidationContext::with_extensions(openjd_model::types::SpecificationRevision::V2023_09, [openjd_model::types::KnownExtension::RedactedEnvVars].into_iter().collect()));
+    let env = env_with_enter("env1", "sh", vec!["-c", "echo 'openjd_redacted_env: SECRET_KEY=secret_val'"]);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo SECRET_KEY=$SECRET_KEY"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("SECRET_KEY=secret_val"));
+
+    // Redaction should work
+    let redacted = s.redact("The key is secret_val");
+    assert!(!redacted.contains("secret_val"));
+}
+
+// === TestSimplifiedEnvironmentVariableChanges ===
+// These test the env var tracking. In Rust, this is handled by the Session's env_vars HashMap.
+
+#[tokio::test]
+async fn test_env_var_changes_init() {
+    let tmp = TempDir::new().unwrap();
+    let s = Session::new(tmp.path().to_path_buf());
+    assert_eq!(s.state(), SessionState::Ready);
+}
+
+// === TestEnvironmentVariablesInTasks_2023_09 — additional tests ===
+
+#[tokio::test]
+async fn test_def_via_multi_line_stdout() {
+    // Test that JSON-encoded multi-line env vars are set correctly
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "sh", vec!["-c", r#"printf '%s\n' 'openjd_env: "FOO=12\n34"'"#]);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "printf 'FOO=%s\n' \"$FOO\""]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("FOO=12\n34") || r.stdout.contains("FOO=12"));
+}
+
+#[tokio::test]
+async fn test_def_via_stdout_set_empty() {
+    // Test that setting an env var to empty string works
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "sh", vec!["-c", "echo 'openjd_env: FOO='"]);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo FOO=$FOO"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("FOO="));
+}
+
+#[tokio::test]
+async fn test_def_via_stdout_set_empty_json() {
+    // Test that setting an env var to empty string via JSON works
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "sh", vec!["-c", r#"echo 'openjd_env: "FOO="'"#]);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo FOO=$FOO"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("FOO="));
+}
+
+#[tokio::test]
+async fn test_def_via_redacted_env_json_stdout() {
+    // Test that redacted env vars are redacted in logs but not set without extension
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "sh", vec!["-c", "echo 'openjd_redacted_env: API_KEY=abc123def456'"]);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    // Without extension, the env var should NOT be set
+    let r = s.run_task(&step("sh", vec!["-c", "echo API_KEY=${API_KEY:-not_set}"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("API_KEY=not_set"));
+
+    // But the value should still be tracked for redaction
+    let redacted = s.redact("The key is abc123def456");
+    assert!(!redacted.contains("abc123def456"));
+}
+
+#[tokio::test]
+async fn test_def_via_redacted_env_with_extension() {
+    // Test that redacted env vars ARE set when extension is enabled
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf()).with_revision_extensions(
+        openjd_model::types::ValidationContext::with_extensions(
+            openjd_model::types::SpecificationRevision::V2023_09,
+            [openjd_model::types::KnownExtension::RedactedEnvVars].into_iter().collect(),
+        ),
+    );
+    let env = env_with_enter("env1", "sh", vec!["-c", "echo 'openjd_redacted_env: PASSWORD=secret123'"]);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo PASSWORD=$PASSWORD"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("PASSWORD=secret123"));
+
+    let redacted = s.redact("PASSWORD=secret123");
+    assert!(!redacted.contains("secret123"));
+}
+
+#[tokio::test]
+async fn test_def_via_redacted_env_with_variables() {
+    // Test that redacted env vars override directly defined variables when extension is NOT enabled
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut vars = HashMap::new();
+    vars.insert("TOKEN".into(), fs("public-token"));
+    let env = Environment {
+        name: "env1".into(), description: None,
+        script: Some(openjd_model::job::EnvironmentScript {
+            let_bindings: None,
+            actions: openjd_model::job::EnvironmentActions {
+                on_enter: Some(action("sh", vec!["-c", "echo 'openjd_redacted_env: TOKEN=secret-token'"])),
+                on_exit: None,
+            },
+            embedded_files: None,
+        }),
+        variables: Some(vars),
+        resolved_symtab: None,
+    };
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    // Without extension, the redacted env should NOT override the direct variable
+    let r = s.run_task(&step("sh", vec!["-c", "echo TOKEN=$TOKEN"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("TOKEN=public-token"));
+
+    // But the secret value should still be tracked for redaction
+    let redacted = s.redact("secret-token");
+    assert!(!redacted.contains("secret-token"));
+}
+
+#[tokio::test]
+async fn test_multiple_different_redacted_env_vars() {
+    // Test that multiple redacted env vars with different values are handled correctly
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf()).with_revision_extensions(
+        openjd_model::types::ValidationContext::with_extensions(
+            openjd_model::types::SpecificationRevision::V2023_09,
+            [openjd_model::types::KnownExtension::RedactedEnvVars].into_iter().collect(),
+        ),
+    );
+    let env = env_with_enter("env1", "sh", vec!["-c",
+        "echo 'openjd_redacted_env: PASSWORD=secret123'; echo 'openjd_redacted_env: PASSWORD2=mysecret123'"
+    ]);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    let r = s.run_task(&step("sh", vec!["-c", "echo PASSWORD=$PASSWORD; echo PASSWORD2=$PASSWORD2"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("PASSWORD=secret123"));
+    assert!(r.stdout.contains("PASSWORD2=mysecret123"));
+
+    let redacted = s.redact("secret123 and mysecret123");
+    assert!(!redacted.contains("secret123"));
+    assert!(!redacted.contains("mysecret123"));
+}
+
+// === TestSessionRunTaskWithoutSessionEnv_2023_09 ===
+// Tests for run_subprocess with use_session_env_vars=false
+
+#[tokio::test]
+async fn test_run_subprocess_basic() {
+    let tmp = TempDir::new().unwrap();
+    let config = openjd_sessions::session::SessionConfig {
+        session_id: "test".into(),
+        job_parameter_values: HashMap::new(),
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: None,
+        os_env_vars: None,
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    };
+    let mut s = Session::with_config(config).unwrap();
+    let r = s.run_subprocess("echo", Some(&["hello_subprocess".into()]), None, None, true, None).await.unwrap();
+    assert_eq!(r.state, openjd_sessions::action::ActionState::Success);
+    assert!(r.stdout.contains("hello_subprocess"));
+}
+
+#[tokio::test]
+async fn test_run_subprocess_ignores_entered_environments() {
+    // Test that run_subprocess with use_session_env_vars=false ignores entered environment variables
+    let tmp = TempDir::new().unwrap();
+    let config = openjd_sessions::session::SessionConfig {
+        session_id: "test".into(),
+        job_parameter_values: HashMap::new(),
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: None,
+        os_env_vars: None,
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    };
+    let mut s = Session::with_config(config).unwrap();
+
+    // Enter an environment that sets FOO=bar
+    let mut vars = HashMap::new();
+    vars.insert("FOO".into(), fs("bar"));
+    let env = env_with_vars("env1", vars);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    // run_subprocess with use_session_env_vars=false should NOT see FOO
+    let r = s.run_subprocess("sh", Some(&["-c".into(), "echo FOO=${FOO:-NOT_SET}".into()]), None, None, false, None).await.unwrap();
+    assert!(r.stdout.contains("FOO=NOT_SET"));
+}
+
+#[tokio::test]
+async fn test_run_subprocess_with_os_env_vars() {
+    let tmp = TempDir::new().unwrap();
+    let config = openjd_sessions::session::SessionConfig {
+        session_id: "test".into(),
+        job_parameter_values: HashMap::new(),
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: None,
+        os_env_vars: None,
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    };
+    let mut s = Session::with_config(config).unwrap();
+    let mut extra = HashMap::new();
+    extra.insert("CUSTOM_VAR".into(), "custom_value".into());
+    let r = s.run_subprocess("sh", Some(&["-c".into(), "echo CUSTOM_VAR=$CUSTOM_VAR".into()]), None, Some(&extra), false, None).await.unwrap();
+    assert!(r.stdout.contains("CUSTOM_VAR=custom_value"));
+}
+
+#[tokio::test]
+async fn test_run_subprocess_includes_constructor_env_vars() {
+    // Test that session constructor env vars are always included
+    let tmp = TempDir::new().unwrap();
+    let mut ctor_env = HashMap::new();
+    ctor_env.insert("CTOR_VAR".into(), "ctor_value".into());
+    let config = openjd_sessions::session::SessionConfig {
+        session_id: "test".into(),
+        job_parameter_values: HashMap::new(),
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: None,
+        os_env_vars: Some(ctor_env),
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    };
+    let mut s = Session::with_config(config).unwrap();
+    let r = s.run_subprocess("sh", Some(&["-c".into(), "echo CTOR_VAR=$CTOR_VAR".into()]), None, None, false, None).await.unwrap();
+    assert!(r.stdout.contains("CTOR_VAR=ctor_value"));
+}
+
+#[tokio::test]
+async fn test_run_subprocess_empty_command_fails() {
+    let tmp = TempDir::new().unwrap();
+    let config = openjd_sessions::session::SessionConfig {
+        session_id: "test".into(),
+        job_parameter_values: HashMap::new(),
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: None,
+        os_env_vars: None,
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    };
+    let mut s = Session::with_config(config).unwrap();
+    assert!(s.run_subprocess("", None, None, None, true, None).await.is_err());
+}
+
+#[tokio::test]
+async fn test_run_subprocess_whitespace_command_fails() {
+    let tmp = TempDir::new().unwrap();
+    let config = openjd_sessions::session::SessionConfig {
+        session_id: "test".into(),
+        job_parameter_values: HashMap::new(),
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: None,
+        os_env_vars: None,
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    };
+    let mut s = Session::with_config(config).unwrap();
+    assert!(s.run_subprocess("   ", None, None, None, true, None).await.is_err());
+}
+
+// === TestSessionExitEnvironment — additional: exit LIFO order ===
+
+#[tokio::test]
+async fn test_exit_environment_lifo_order() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env1 = env_with_vars("env1", HashMap::new());
+    let env2 = env_with_vars("env2", HashMap::new());
+    let id1 = s.enter_environment(&env1, None, None, None).await.unwrap();
+    let id2 = s.enter_environment(&env2, None, None, None).await.unwrap();
+
+    // Must exit env2 first (LIFO)
+    assert!(s.exit_environment(&id1, None, true, None).await.is_err());
+    assert!(s.exit_environment(&id2, None, true, None).await.is_ok());
+    assert!(s.exit_environment(&id1, None, true, None).await.is_ok());
+}
+
+// === TestSessionExitEnvironment — exit unknown identifier ===
+
+#[tokio::test]
+async fn test_exit_unknown_environment() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    assert!(s.exit_environment(&"nonexistent".to_string(), None, true, None).await.is_err());
+}
+
+// === Redefinition exit restores outer value ===
+
+#[tokio::test]
+async fn test_redefinition_exit() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let mut vars1 = HashMap::new();
+    vars1.insert("VAR".into(), fs("outer"));
+    let env1 = env_with_vars("env1", vars1);
+    let _id1 = s.enter_environment(&env1, None, None, None).await.unwrap();
+
+    let mut vars2 = HashMap::new();
+    vars2.insert("VAR".into(), fs("inner"));
+    let env2 = env_with_vars("env2", vars2);
+    let id2 = s.enter_environment(&env2, None, None, None).await.unwrap();
+
+    // Exit inner env — outer value should be restored
+    s.exit_environment(&id2, None, true, None).await.unwrap();
+    let r = s.run_task(&step("sh", vec!["-c", "echo VAR=$VAR"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("VAR=outer"));
+}
+
+// === Real-time message processing tests ===
+
+/// Helper: create a SessionConfig with a callback that records (elapsed, state, progress).
+fn realtime_test_config(
+    tmp: &TempDir,
+    session_id: &str,
+    timestamps: std::sync::Arc<std::sync::Mutex<Vec<(std::time::Duration, ActionState, Option<f64>, Option<String>)>>>,
+) -> openjd_sessions::session::SessionConfig {
+    let start = std::time::Instant::now();
+    let ts = timestamps.clone();
+    openjd_sessions::session::SessionConfig {
+        session_id: session_id.into(),
+        job_parameter_values: HashMap::new(),
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: Some(Box::new(move |_sid, status| {
+            ts.lock().unwrap().push((
+                start.elapsed(), status.state,
+                status.progress, status.status_message.clone(),
+            ));
+        })),
+        os_env_vars: None,
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    }
+}
+
+#[tokio::test]
+async fn test_callback_receives_progress_before_completion() {
+    let tmp = TempDir::new().unwrap();
+    let ts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = Session::with_config(realtime_test_config(&tmp, "rt-prog", ts.clone())).unwrap();
+
+    // Emit progress immediately, then sleep 100ms.
+    let script = step("sh", vec!["-c", "echo 'openjd_progress: 50.0'; sleep 0.1"]);
+    let t0 = std::time::Instant::now();
+    s.run_task(&script, None, None, None).await.unwrap();
+    let total = t0.elapsed();
+
+    let ts = ts.lock().unwrap();
+    let first = ts.iter()
+        .find(|(_, st, p, _)| *st == ActionState::Running && p.is_some());
+    let first = first.expect("Expected progress callback during RUNNING");
+    assert!(
+        first.0 < total / 2,
+        "Progress callback at {:?} but task took {:?} — not real-time", first.0, total
+    );
+}
+
+#[tokio::test]
+async fn test_callback_receives_status_before_completion() {
+    let tmp = TempDir::new().unwrap();
+    let ts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = Session::with_config(realtime_test_config(&tmp, "rt-stat", ts.clone())).unwrap();
+
+    let script = step("sh", vec!["-c", "echo 'openjd_status: Rendering frame 1'; sleep 0.1"]);
+    let t0 = std::time::Instant::now();
+    s.run_task(&script, None, None, None).await.unwrap();
+    let total = t0.elapsed();
+
+    let ts = ts.lock().unwrap();
+    let first = ts.iter()
+        .find(|(_, st, _, msg)| *st == ActionState::Running && msg.is_some());
+    let first = first.expect("Expected status callback during RUNNING");
+    assert!(
+        first.0 < total / 2,
+        "Status callback at {:?} but task took {:?} — not real-time", first.0, total
+    );
+}
+
+#[tokio::test]
+async fn test_env_enter_callback_receives_progress_before_completion() {
+    let tmp = TempDir::new().unwrap();
+    let ts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = Session::with_config(realtime_test_config(&tmp, "rt-env", ts.clone())).unwrap();
+
+    let env = env_with_enter("env1", "sh", vec!["-c", "echo 'openjd_progress: 50.0'; sleep 0.1"]);
+    let t0 = std::time::Instant::now();
+    s.enter_environment(&env, None, None, None).await.unwrap();
+    let total = t0.elapsed();
+
+    let ts = ts.lock().unwrap();
+    let first = ts.iter()
+        .find(|(_, st, p, _)| *st == ActionState::Running && p.is_some());
+    let first = first.expect("Expected progress callback during env enter RUNNING");
+    assert!(
+        first.0 < total / 2,
+        "Progress callback at {:?} but enter took {:?} — not real-time", first.0, total
+    );
+}
+
+// === Tests for per-action os_env_vars ===
+
+#[tokio::test]
+async fn test_run_task_with_per_action_os_env_vars() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let extra = HashMap::from([("EXTRA_VAR".to_string(), "extra_value".to_string())]);
+    let r = s.run_task(&step("sh", vec!["-c", "echo EXTRA_VAR=$EXTRA_VAR"]), None, None, Some(&extra)).await.unwrap();
+    assert_eq!(r.state, ActionState::Success);
+    assert!(r.stdout.contains("EXTRA_VAR=extra_value"));
+}
+
+#[tokio::test]
+async fn test_enter_environment_with_per_action_os_env_vars() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = env_with_enter("env1", "sh", vec!["-c", "echo ACTION_VAR=$ACTION_VAR"]);
+    let extra = HashMap::from([("ACTION_VAR".to_string(), "from_action".to_string())]);
+    let (_, stdout) = s.enter_environment_with_output(&env, None, None, Some(&extra)).await.unwrap();
+    assert!(stdout.contains("ACTION_VAR=from_action"));
+}
+
+#[tokio::test]
+async fn test_exit_environment_with_per_action_os_env_vars() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = Environment {
+        name: "env1".into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions {
+                on_enter: None,
+                on_exit: Some(action("sh", vec!["-c", "echo EXIT_VAR=$EXIT_VAR"])),
+            },
+            embedded_files: None,
+        }),
+        variables: None,
+        resolved_symtab: None,
+    };
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    let extra = HashMap::from([("EXIT_VAR".to_string(), "from_exit".to_string())]);
+    let stdout = s.exit_environment(&id, None, true, Some(&extra)).await.unwrap();
+    assert!(stdout.contains("EXIT_VAR=from_exit"));
+}
+
+#[tokio::test]
+async fn test_per_action_os_env_vars_override_session_env() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    // Set a session-level env var via an environment's variables block
+    let mut vars = HashMap::new();
+    vars.insert("MY_VAR".into(), fs("session_value"));
+    let env = env_with_vars("env1", vars);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+
+    // Per-action os_env_vars should be overridden by environment-defined vars
+    // (matching Python's layering: process_env < per-action < environment-defined)
+    let extra = HashMap::from([("MY_VAR".to_string(), "action_value".to_string())]);
+    let r = s.run_task(&step("sh", vec!["-c", "echo MY_VAR=$MY_VAR"]), None, None, Some(&extra)).await.unwrap();
+    // Environment-defined vars take precedence over per-action vars
+    assert!(r.stdout.contains("MY_VAR=session_value"));
+}
+
+#[tokio::test]
+async fn test_per_action_os_env_vars_do_not_persist() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let extra = HashMap::from([("EPHEMERAL".to_string(), "yes".to_string())]);
+    let r = s.run_task(&step("sh", vec!["-c", "echo EPHEMERAL=$EPHEMERAL"]), None, None, Some(&extra)).await.unwrap();
+    assert!(r.stdout.contains("EPHEMERAL=yes"));
+
+    // Next action without extra env vars should NOT see the variable
+    let r = s.run_task(&step("sh", vec!["-c", "echo EPHEMERAL=${EPHEMERAL:-gone}"]), None, None, None).await.unwrap();
+    assert!(r.stdout.contains("EPHEMERAL=gone"));
+}
+
+// === TestCancelAction ===
+
+#[tokio::test]
+async fn test_cancel_action_not_running() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    // Session is in READY state, cancel should fail
+    let result = s.cancel_action(None, false);
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_cancel_action_mark_failed() {
+    let tmp = TempDir::new().unwrap();
+    let config = openjd_sessions::session::SessionConfig {
+        session_id: "cancel-test".into(),
+        job_parameter_values: HashMap::new(),
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: None,
+        os_env_vars: None,
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    };
+    let mut s = Session::with_config(config).unwrap();
+
+    // Test via malformed env command which triggers CancelMarkFailed internally.
+    // openjd_env:bad=value (no space after colon) is detected as malformed,
+    // causing cancel with mark_action_failed=true.
+    let script = step("sh", vec!["-c", "echo 'openjd_env:bad=value'; sleep 10"]);
+    let r = s.run_task(&script, None, None, None).await.unwrap();
+    assert_eq!(r.state, ActionState::Failed, "Malformed env command should cause Failed state, got {:?}", r.state);
+    assert_eq!(s.state(), SessionState::ReadyEnding);
+}
+
+#[tokio::test]
+async fn test_malformed_env_cancels_and_marks_failed() {
+    // Test that a malformed openjd_env command (missing space after colon) causes
+    // the action to be canceled and marked as failed
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+
+    let script = step("sh", vec!["-c", "echo 'openjd_env:FOO=bar'; sleep 10"]);
+    let r = s.run_task(&script, None, None, None).await.unwrap();
+    assert_eq!(r.state, ActionState::Failed);
+    assert_eq!(s.state(), SessionState::ReadyEnding);
+
+    // Check that the fail message was set
+    let status = s.action_status().unwrap();
+    assert!(status.fail_message.is_some());
+}
+
+#[tokio::test]
+async fn test_malformed_unset_env_cancels_and_marks_failed() {
+    // Test that a malformed openjd_unset_env command causes cancel+fail
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+
+    let script = step("sh", vec!["-c", "echo 'openjd_unset_env:FOO'; sleep 10"]);
+    let r = s.run_task(&script, None, None, None).await.unwrap();
+    assert_eq!(r.state, ActionState::Failed);
+}
+
+#[tokio::test]
+async fn test_invalid_env_var_name_cancels_and_marks_failed() {
+    // Test that an invalid env var name (starts with digit) causes cancel+fail
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+
+    let script = step("sh", vec!["-c", "echo 'openjd_env: 1BAD=value'; sleep 10"]);
+    let r = s.run_task(&script, None, None, None).await.unwrap();
+    assert_eq!(r.state, ActionState::Failed);
+}
+
+// === TestGetEnabledExtensions ===
+
+#[tokio::test]
+async fn test_get_enabled_extensions_with_extensions() {
+    let tmp = TempDir::new().unwrap();
+    let s = Session::new(tmp.path().to_path_buf()).with_revision_extensions(
+        openjd_model::types::ValidationContext::with_extensions(
+            openjd_model::types::SpecificationRevision::V2023_09,
+            [openjd_model::types::KnownExtension::Expr, openjd_model::types::KnownExtension::RedactedEnvVars].into_iter().collect(),
+        ),
+    );
+    let mut exts = s.get_enabled_extensions();
+    exts.sort();
+    assert_eq!(exts, vec!["EXPR", "REDACTED_ENV_VARS"]);
+}
+
+#[tokio::test]
+async fn test_get_enabled_extensions_empty() {
+    let tmp = TempDir::new().unwrap();
+    let s = Session::new(tmp.path().to_path_buf());
+    assert!(s.get_enabled_extensions().is_empty());
+}
+
+// === InvalidState error carries SessionState enum values ===
+
+#[tokio::test]
+async fn invalid_state_error_carries_enum_values() {
+    // After cleanup (Ended), enter_environment should give InvalidState
+    // with expected=[Ready], current=Ended as SessionState values.
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    s.cleanup();
+    let env = env_with_enter("env1", "echo", vec!["hi"]);
+    let err = s.enter_environment(&env, None, None, None).await.unwrap_err();
+    match err {
+        openjd_sessions::error::SessionError::InvalidState { expected, current } => {
+            assert_eq!(expected, &[SessionState::Ready]);
+            assert_eq!(current, SessionState::Ended);
+        }
+        other => panic!("expected InvalidState, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn invalid_state_error_multiple_expected_states() {
+    // exit_environment when in Ended state should give expected=[Ready, ReadyEnding]
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    s.cleanup();
+    let id = "env1".to_string();
+    let err = s.exit_environment(&id, None, false, None).await.unwrap_err();
+    match err {
+        openjd_sessions::error::SessionError::InvalidState { expected, current } => {
+            assert!(expected.contains(&SessionState::Ready), "expected should contain Ready");
+            assert!(expected.contains(&SessionState::ReadyEnding), "expected should contain ReadyEnding");
+            assert_eq!(current, SessionState::Ended);
+        }
+        other => panic!("expected InvalidState, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn invalid_state_error_display_format() {
+    // Verify the Display output is human-readable
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    s.cleanup();
+    let env = env_with_enter("env1", "echo", vec!["hi"]);
+    let err = s.enter_environment(&env, None, None, None).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("READY"), "should mention expected state: {msg}");
+    assert!(msg.contains("ENDED"), "should mention current state: {msg}");
+}
+
+// === Action-level timeout enforcement ===
+
+fn action_with_timeout(cmd: &str, args: Vec<&str>, timeout_secs: &str) -> Action {
+    Action {
+        command: fs(cmd),
+        args: Some(args.iter().map(|a| fs(a)).collect()),
+        timeout: Some(fs(timeout_secs)),
+        cancelation: None,
+    }
+}
+
+/// Step script onRun action with a timeout should kill the process when the
+/// timeout expires and report ActionState::Timeout.
+#[tokio::test]
+async fn test_run_task_action_timeout_enforced() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let script = StepScript {
+        let_bindings: None,
+        actions: StepActions {
+            on_run: action_with_timeout("sh", vec!["-c", "echo start; sleep 30; echo done"], "1"),
+        },
+        embedded_files: None,
+    };
+    let start = std::time::Instant::now();
+    let r = s.run_task(&script, None, None, None).await.unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(
+        r.state,
+        ActionState::Timeout,
+        "Expected Timeout but got {:?} (exit_code={:?})",
+        r.state,
+        r.exit_code
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "Timeout should have fired quickly, but took {elapsed:?}"
+    );
+    assert!(r.stdout.contains("start"), "Should see output before timeout");
+    assert!(!r.stdout.contains("done"), "Should not see output after timeout");
+}
+
+/// Environment onEnter action with a timeout should be enforced.
+#[tokio::test]
+async fn test_enter_environment_action_timeout_enforced() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let env = Environment {
+        name: "timeout_env".into(),
+        description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions {
+                on_enter: Some(action_with_timeout("sh", vec!["-c", "echo entering; sleep 30"], "1")),
+                on_exit: None,
+            },
+            embedded_files: None,
+        }),
+        variables: None,
+        resolved_symtab: None,
+    };
+    let start = std::time::Instant::now();
+    let result = s.enter_environment(&env, None, None, None).await;
+    let elapsed = start.elapsed();
+    // onEnter failure returns an error
+    assert!(result.is_err(), "Expected error from timed-out onEnter, got Ok");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "Timeout should have fired quickly, but took {elapsed:?}"
+    );
+}
+
+/// Environment onExit action with an explicit timeout should use that timeout,
+/// not the 5-minute default.
+#[tokio::test]
+async fn test_exit_environment_action_timeout_enforced() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    // Enter with a simple env first
+    let env = Environment {
+        name: "exit_timeout_env".into(),
+        description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions {
+                on_enter: Some(action("echo", vec!["entered"])),
+                on_exit: Some(action_with_timeout("sh", vec!["-c", "echo exiting; sleep 30"], "1")),
+            },
+            embedded_files: None,
+        }),
+        variables: None,
+        resolved_symtab: None,
+    };
+    let id = s.enter_environment(&env, None, None, None).await.unwrap();
+    let start = std::time::Instant::now();
+    let result = s.exit_environment(&id, None, true, None).await;
+    let elapsed = start.elapsed();
+    // onExit failure returns an error
+    assert!(result.is_err(), "Expected error from timed-out onExit, got Ok");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "Timeout should have fired in ~1s, not the 5-minute default ({elapsed:?})"
+    );
+}
+
+/// Action with no timeout should still work (no regression).
+#[tokio::test]
+async fn test_run_task_no_timeout_still_works() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    let r = s.run_task(&step("sh", vec!["-c", "echo hello"]), None, None, None).await.unwrap();
+    assert_eq!(r.state, ActionState::Success);
+    assert!(r.stdout.contains("hello"));
+}
+
+// === Callback coverage tests ===
+// Verify the callback fires in every code path: with-script, no-script,
+// success, failure, command-not-found, for enter/exit/task/subprocess.
+
+type CbLog = Vec<(ActionState, Option<f64>)>;
+
+fn cb_test_config(tmp: &TempDir, id: &str, log: Arc<Mutex<CbLog>>) -> SessionConfig {
+    SessionConfig {
+        session_id: id.into(),
+        job_parameter_values: HashMap::new(),
+        path_mapping_rules: None,
+        retain_working_dir: false,
+        callback: Some(Box::new(move |_sid, status| {
+            log.lock().unwrap().push((status.state, status.progress));
+        })),
+        os_env_vars: None,
+        session_root_directory: Some(tmp.path().to_path_buf()),
+        user: None,
+        revision_extensions: None,
+        cancel_token: None,
+    }
+}
+
+#[tokio::test]
+async fn test_callback_enter_env_with_script() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-enter-script", log.clone())).unwrap();
+    let env = env_with_enter("e", "sh", vec!["-c", "echo hello"]);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for enter_environment with script");
+    assert!(log.iter().any(|(st, _)| *st == ActionState::Success), "Must have Success callback");
+}
+
+#[tokio::test]
+async fn test_callback_enter_env_no_script_with_vars() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-enter-vars", log.clone())).unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("FOO".into(), FormatString::new("bar").unwrap());
+    let env = env_with_vars("e", vars);
+    s.enter_environment(&env, None, None, None).await.unwrap();
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for enter_environment with variables only");
+    assert_eq!(log.last().unwrap().0, ActionState::Success);
+}
+
+#[tokio::test]
+async fn test_callback_enter_env_no_script_no_vars() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-enter-empty", log.clone())).unwrap();
+    let env = Environment {
+        name: "empty".into(), description: None, script: None, variables: None,
+        resolved_symtab: None,
+    };
+    s.enter_environment(&env, None, None, None).await.unwrap();
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for enter_environment with no script and no vars");
+    assert_eq!(log.last().unwrap().0, ActionState::Success);
+}
+
+#[tokio::test]
+async fn test_callback_exit_env_with_script() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-exit-script", log.clone())).unwrap();
+    let env = Environment {
+        name: "e".into(), description: None,
+        script: Some(EnvironmentScript {
+            let_bindings: None,
+            actions: EnvironmentActions {
+                on_enter: None,
+                on_exit: Some(action("sh", vec!["-c", "echo bye"])),
+            },
+            embedded_files: None,
+        }),
+        variables: None,
+        resolved_symtab: None,
+    };
+    s.enter_environment(&env, None, Some("eid"), None).await.unwrap();
+    log.lock().unwrap().clear(); // clear enter callbacks
+    s.exit_environment(&"eid".to_string(), None, true, None).await.unwrap();
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for exit_environment with script");
+    assert!(log.iter().any(|(st, _)| *st == ActionState::Success));
+}
+
+#[tokio::test]
+async fn test_callback_exit_env_no_script() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-exit-noscript", log.clone())).unwrap();
+    let env = Environment {
+        name: "e".into(), description: None, script: None, variables: None,
+        resolved_symtab: None,
+    };
+    s.enter_environment(&env, None, Some("eid"), None).await.unwrap();
+    log.lock().unwrap().clear();
+    s.exit_environment(&"eid".to_string(), None, true, None).await.unwrap();
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for exit_environment with no script");
+    assert_eq!(log.last().unwrap().0, ActionState::Success);
+}
+
+#[tokio::test]
+async fn test_callback_run_task_success() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-task-ok", log.clone())).unwrap();
+    s.run_task(&step("sh", vec!["-c", "echo ok"]), None, None, None).await.unwrap();
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for run_task success");
+    assert!(log.iter().any(|(st, _)| *st == ActionState::Success));
+}
+
+#[tokio::test]
+async fn test_callback_run_task_failure() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-task-fail", log.clone())).unwrap();
+    let r = s.run_task(&step("sh", vec!["-c", "exit 1"]), None, None, None).await.unwrap();
+    assert_eq!(r.state, ActionState::Failed);
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for run_task failure");
+    assert!(log.iter().any(|(st, _)| *st == ActionState::Failed));
+}
+
+#[tokio::test]
+async fn test_callback_run_task_command_not_found() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-task-notfound", log.clone())).unwrap();
+    let r = s.run_task(&step("nonexistent-cmd-xyz", vec![]), None, None, None).await;
+    assert!(r.is_err());
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for run_task command not found");
+    assert!(log.iter().any(|(st, _)| *st == ActionState::Failed));
+}
+
+#[tokio::test]
+async fn test_callback_enter_env_command_not_found() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-env-notfound", log.clone())).unwrap();
+    let env = env_with_enter("e", "nonexistent-cmd-xyz", vec![]);
+    let r = s.enter_environment(&env, None, None, None).await;
+    assert!(r.is_err());
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for enter_environment command not found");
+    assert!(log.iter().any(|(st, _)| *st == ActionState::Failed));
+}
+
+#[tokio::test]
+async fn test_callback_run_subprocess_success() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-subproc", log.clone())).unwrap();
+    s.run_subprocess("echo", Some(&["hello".into()]), None, None, true, None).await.unwrap();
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for run_subprocess");
+    assert!(log.iter().any(|(st, _)| *st == ActionState::Success));
+}
+
+#[tokio::test]
+async fn test_callback_run_subprocess_command_not_found() {
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-subproc-notfound", log.clone())).unwrap();
+    let r = s.run_subprocess("nonexistent-cmd-xyz", None, None, None, true, None).await;
+    assert!(r.is_err());
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Callback must fire for run_subprocess command not found");
+    assert!(log.iter().any(|(st, _)| *st == ActionState::Failed));
+}
+
+#[tokio::test]
+async fn test_callback_progress_not_leaked_between_actions() {
+    // Regression: progress from one action must not leak into the next.
+    let tmp = TempDir::new().unwrap();
+    let log: Arc<Mutex<CbLog>> = Arc::new(Mutex::new(Vec::new()));
+    let mut s = Session::with_config(cb_test_config(&tmp, "cb-no-leak", log.clone())).unwrap();
+
+    // First action sets progress to 50%
+    let env = env_with_enter("e", "sh", vec!["-c", "echo 'openjd_progress: 50.0'"]);
+    s.enter_environment(&env, None, Some("eid"), None).await.unwrap();
+
+    // Check that progress was set
+    let has_progress = log.lock().unwrap().iter().any(|(_, p)| *p == Some(50.0));
+    assert!(has_progress, "First action should have 50% progress");
+
+    log.lock().unwrap().clear();
+
+    // Second action: exit with no script — should NOT have 50% progress
+    s.exit_environment(&"eid".to_string(), None, true, None).await.unwrap();
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty(), "Exit callback must fire");
+    for (state, progress) in log.iter() {
+        assert_eq!(*state, ActionState::Success);
+        assert_eq!(*progress, None, "Progress from previous action must not leak: got {:?}", progress);
+    }
+}
+
+// === run_task state validation ===
+
+#[tokio::test]
+async fn test_run_task_rejects_ended_state() {
+    let tmp = TempDir::new().unwrap();
+    let mut s = Session::new(tmp.path().to_path_buf());
+    s.cleanup();
+    assert_eq!(s.state(), SessionState::Ended);
+
+    let result = s.run_task(&step("echo", vec!["hello"]), None, None, None).await;
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("READY"), "Expected InvalidState error, got: {err}");
+}

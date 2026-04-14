@@ -1,0 +1,452 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Integration tests: template → create_job → StepParameterSpaceIterator.
+//! Ported from Python test_step_param_space_iter.py.
+
+use openjd_model::{decode_job_template, preprocess_job_parameters, create_job};
+use openjd_model::step_param_space::StepParameterSpaceIterator;
+use openjd_model::JobParameterInputValues;
+
+fn yaml_val(s: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(s).unwrap()
+}
+
+fn create_and_iterate(template_json: &str, params: &[(&str, &str)]) -> Vec<openjd_model::types::TaskParameterSet> {
+    let v = yaml_val(template_json);
+    let supported = vec!["EXPR", "FEATURE_BUNDLE_1", "TASK_CHUNKING"];
+    let supported_refs: Vec<&str> = supported.iter().copied().collect();
+    let jt = decode_job_template(v, Some(&supported_refs)).unwrap();
+    let mut input = JobParameterInputValues::new();
+    for (k, val) in params {
+        input.insert(k.to_string(), openjd_expr::ExprValue::String(val.to_string()));
+    }
+    let processed = preprocess_job_parameters(&jt, &input, &[], std::path::Path::new("/tmp/template"), std::path::Path::new("/tmp/cwd"), true).unwrap();
+    let job = create_job(&jt, &processed).unwrap();
+    let step = &job.steps[0];
+    if let Some(ps) = &step.parameter_space {
+        let iter = StepParameterSpaceIterator::new(ps).unwrap();
+        iter.collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn task_val_str(tasks: &[openjd_model::types::TaskParameterSet], task_idx: usize, param_name: &str) -> String {
+    let tv = &tasks[task_idx][param_name];
+    match &tv.value {
+        openjd_expr::ExprValue::Int(i) => i.to_string(),
+        openjd_expr::ExprValue::Float(f) => f.to_string(),
+        openjd_expr::ExprValue::String(s) => s.clone(),
+        openjd_expr::ExprValue::Bool(b) => b.to_string(),
+        other => format!("{:?}", other),
+    }
+}
+
+#[test]
+fn test_no_param_space() {
+    let v = yaml_val(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "do thing"}}}}]
+    }"#);
+    let jt = decode_job_template(v, None).unwrap();
+    let processed = preprocess_job_parameters(&jt, &JobParameterInputValues::new(), &[], std::path::Path::new("/tmp"), std::path::Path::new("/tmp"), true).unwrap();
+    let job = create_job(&jt, &processed).unwrap();
+    assert!(job.steps[0].parameter_space.is_none());
+}
+
+#[test]
+fn test_single_int_range_list() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {"taskParameterDefinitions": [{"name": "Frame", "type": "INT", "range": [1, 2, 3]}]}
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(task_val_str(&tasks, 0, "Frame"), "1");
+    assert_eq!(task_val_str(&tasks, 1, "Frame"), "2");
+    assert_eq!(task_val_str(&tasks, 2, "Frame"), "3");
+}
+
+#[test]
+fn test_single_int_range_expression() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {"taskParameterDefinitions": [{"name": "Frame", "type": "INT", "range": "1-5"}]}
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 5);
+    assert_eq!(task_val_str(&tasks, 0, "Frame"), "1");
+    assert_eq!(task_val_str(&tasks, 4, "Frame"), "5");
+}
+
+#[test]
+fn test_string_range() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {"taskParameterDefinitions": [{"name": "Color", "type": "STRING", "range": ["red", "green", "blue"]}]}
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(task_val_str(&tasks, 0, "Color"), "red");
+    assert_eq!(task_val_str(&tasks, 1, "Color"), "green");
+    assert_eq!(task_val_str(&tasks, 2, "Color"), "blue");
+}
+
+#[test]
+fn test_float_range() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {"taskParameterDefinitions": [{"name": "Scale", "type": "FLOAT", "range": [1.0, 2.5, 3.0]}]}
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 3);
+}
+
+#[test]
+fn test_product_combination() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {
+                "taskParameterDefinitions": [
+                    {"name": "A", "type": "INT", "range": [1, 2]},
+                    {"name": "B", "type": "STRING", "range": ["x", "y", "z"]}
+                ],
+                "combination": "A * B"
+            }
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 6);
+}
+
+#[test]
+fn test_association_combination() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {
+                "taskParameterDefinitions": [
+                    {"name": "A", "type": "INT", "range": [1, 2, 3]},
+                    {"name": "B", "type": "STRING", "range": ["x", "y", "z"]}
+                ],
+                "combination": "(A, B)"
+            }
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(task_val_str(&tasks, 0, "A"), "1");
+    assert_eq!(task_val_str(&tasks, 0, "B"), "x");
+    assert_eq!(task_val_str(&tasks, 2, "A"), "3");
+    assert_eq!(task_val_str(&tasks, 2, "B"), "z");
+}
+
+#[test]
+fn test_format_string_in_range() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "parameterDefinitions": [{"name": "Prefix", "type": "STRING"}],
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {"taskParameterDefinitions": [{"name": "File", "type": "STRING", "range": ["{{Param.Prefix}}_a", "{{Param.Prefix}}_b"]}]}
+        }]
+    }"#, &[("Prefix", "test")]);
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(task_val_str(&tasks, 0, "File"), "test_a");
+    assert_eq!(task_val_str(&tasks, 1, "File"), "test_b");
+}
+
+#[test]
+fn test_path_range() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {"taskParameterDefinitions": [{"name": "Dir", "type": "PATH", "range": ["/tmp/a", "/tmp/b"]}]}
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(task_val_str(&tasks, 0, "Dir"), "/tmp/a");
+    assert_eq!(task_val_str(&tasks, 1, "Dir"), "/tmp/b");
+}
+
+// === Tests ported from Python test_step_param_space_iter.py ===
+
+#[test]
+fn test_iterator_names() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {
+                "taskParameterDefinitions": [
+                    {"name": "Param1", "type": "INT", "range": [1, 2]},
+                    {"name": "Param2", "type": "STRING", "range": ["a", "b", "c"]}
+                ]
+            }
+        }]
+    }"#, &[]);
+    // Verify we got the right number of tasks (product: 2*3=6)
+    assert_eq!(tasks.len(), 6);
+}
+
+#[test]
+fn test_single_param_len() {
+    // Test len for various range types
+    for (range, expected_len) in [
+        ("[1, 2, 3]", 3usize),
+        (r#""1-5""#, 5),
+        ("[0, 10, 20, 40]", 4),
+    ] {
+        let template = format!(r#"{{
+            "specificationVersion": "jobtemplate-2023-09",
+            "name": "Job",
+            "steps": [{{"name": "step", "script": {{"actions": {{"onRun": {{"command": "echo"}}}}}},
+                "parameterSpace": {{"taskParameterDefinitions": [{{"name": "Param1", "type": "INT", "range": {range}}}]}}
+            }}]
+        }}"#);
+        let tasks = create_and_iterate(&template, &[]);
+        assert_eq!(tasks.len(), expected_len, "Failed for range {range}");
+    }
+}
+
+#[test]
+fn test_product_iteration_three_params() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {
+                "taskParameterDefinitions": [
+                    {"name": "Param1", "type": "INT", "range": [1, 2]},
+                    {"name": "Param2", "type": "STRING", "range": ["a", "b", "c"]},
+                    {"name": "Param3", "type": "INT", "range": [-1, -2]}
+                ],
+                "combination": "Param1 * Param2 * Param3"
+            }
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 12); // 2 * 3 * 2
+    // First element
+    assert_eq!(task_val_str(&tasks, 0, "Param1"), "1");
+    assert_eq!(task_val_str(&tasks, 0, "Param2"), "a");
+    assert_eq!(task_val_str(&tasks, 0, "Param3"), "-1");
+    // Second element (rightmost moves fastest)
+    assert_eq!(task_val_str(&tasks, 1, "Param1"), "1");
+    assert_eq!(task_val_str(&tasks, 1, "Param2"), "a");
+    assert_eq!(task_val_str(&tasks, 1, "Param3"), "-2");
+    // Last element
+    assert_eq!(task_val_str(&tasks, 11, "Param1"), "2");
+    assert_eq!(task_val_str(&tasks, 11, "Param2"), "c");
+    assert_eq!(task_val_str(&tasks, 11, "Param3"), "-2");
+}
+
+#[test]
+fn test_product_len() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {
+                "taskParameterDefinitions": [
+                    {"name": "Param1", "type": "INT", "range": "1-2"},
+                    {"name": "Param2", "type": "STRING", "range": ["a", "b", "c"]},
+                    {"name": "Param3", "type": "INT", "range": [-1, -2]}
+                ],
+                "combination": "Param1 * Param2 * Param3"
+            }
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 2 * 3 * 2);
+}
+
+#[test]
+fn test_associate_iteration() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {
+                "taskParameterDefinitions": [
+                    {"name": "Param1", "type": "INT", "range": "1-4"},
+                    {"name": "Param2", "type": "STRING", "range": ["a", "b", "c", "d"]},
+                    {"name": "Param3", "type": "INT", "range": [-1, -2, -3, -4]}
+                ],
+                "combination": "(Param1, Param2, Param3)"
+            }
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 4);
+    assert_eq!(task_val_str(&tasks, 0, "Param1"), "1");
+    assert_eq!(task_val_str(&tasks, 0, "Param2"), "a");
+    assert_eq!(task_val_str(&tasks, 0, "Param3"), "-1");
+    assert_eq!(task_val_str(&tasks, 3, "Param1"), "4");
+    assert_eq!(task_val_str(&tasks, 3, "Param2"), "d");
+    assert_eq!(task_val_str(&tasks, 3, "Param3"), "-4");
+}
+
+#[test]
+fn test_associate_len() {
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {
+                "taskParameterDefinitions": [
+                    {"name": "Param1", "type": "INT", "range": [1, 2, 3, 4]},
+                    {"name": "Param2", "type": "STRING", "range": ["a", "b", "c", "d"]},
+                    {"name": "Param3", "type": "INT", "range": "-1--4:-1"}
+                ],
+                "combination": "(Param1, Param2, Param3)"
+            }
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 4);
+}
+
+#[test]
+fn test_nested_expr_iteration() {
+    // Param1 * (Param2, Param3 * Param4)
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {
+                "taskParameterDefinitions": [
+                    {"name": "Param1", "type": "INT", "range": [1, 2]},
+                    {"name": "Param2", "type": "STRING", "range": ["a", "b", "c", "d"]},
+                    {"name": "Param3", "type": "INT", "range": "10-11"},
+                    {"name": "Param4", "type": "INT", "range": [20, 21]}
+                ],
+                "combination": "Param1 * (Param2, Param3 * Param4)"
+            }
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 8); // 2 * 4
+    assert_eq!(task_val_str(&tasks, 0, "Param1"), "1");
+    assert_eq!(task_val_str(&tasks, 0, "Param2"), "a");
+    assert_eq!(task_val_str(&tasks, 0, "Param3"), "10");
+    assert_eq!(task_val_str(&tasks, 0, "Param4"), "20");
+    assert_eq!(task_val_str(&tasks, 1, "Param2"), "b");
+    assert_eq!(task_val_str(&tasks, 1, "Param3"), "10");
+    assert_eq!(task_val_str(&tasks, 1, "Param4"), "21");
+}
+
+#[test]
+fn test_defaults_product_combination() {
+    // When no combination is specified, default is product of all params
+    let tasks = create_and_iterate(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {
+                "taskParameterDefinitions": [
+                    {"name": "Param1", "type": "INT", "range": [1, 2]},
+                    {"name": "Param2", "type": "STRING", "range": ["a", "b"]}
+                ]
+            }
+        }]
+    }"#, &[]);
+    assert_eq!(tasks.len(), 4); // 2 * 2
+    // Verify all expected combinations exist (order may vary)
+    let mut found = std::collections::HashSet::new();
+    for t in &tasks {
+        let p1 = task_val_str(&[t.clone()], 0, "Param1");
+        let p2 = task_val_str(&[t.clone()], 0, "Param2");
+        found.insert((p1, p2));
+    }
+    assert!(found.contains(&("1".to_string(), "a".to_string())));
+    assert!(found.contains(&("1".to_string(), "b".to_string())));
+    assert!(found.contains(&("2".to_string(), "a".to_string())));
+    assert!(found.contains(&("2".to_string(), "b".to_string())));
+}
+
+#[test]
+fn test_contains_check() {
+    // Verify contains works for single param
+    let v = yaml_val(r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {"taskParameterDefinitions": [{"name": "Param1", "type": "INT", "range": [10, 11, 12]}]}
+        }]
+    }"#);
+    let jt = decode_job_template(v, None).unwrap();
+    let processed = preprocess_job_parameters(&jt, &JobParameterInputValues::new(), &[], std::path::Path::new("/tmp"), std::path::Path::new("/tmp"), true).unwrap();
+    let job = create_job(&jt, &processed).unwrap();
+    let ps = job.steps[0].parameter_space.as_ref().unwrap();
+    let iter = StepParameterSpaceIterator::new(ps).unwrap();
+
+    // Build a task parameter set that should be in the space
+    let mut in_set = openjd_model::types::TaskParameterSet::new();
+    in_set.insert("Param1".to_string(), openjd_model::types::TaskParameterValue {
+        param_type: openjd_model::types::TaskParameterType::Int,
+        value: openjd_expr::ExprValue::Int(10),
+    });
+    assert!(iter.contains(&in_set));
+
+    // Build one that should NOT be in the space
+    let mut not_in_set = openjd_model::types::TaskParameterSet::new();
+    not_in_set.insert("Param1".to_string(), openjd_model::types::TaskParameterValue {
+        param_type: openjd_model::types::TaskParameterType::Int,
+        value: openjd_expr::ExprValue::Int(9),
+    });
+    assert!(!iter.contains(&not_in_set));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Default product combination — iteration order determinism
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// When no explicit combination expression is provided, the default product
+/// must iterate parameters in template definition order (leftmost moves
+/// slowest, rightmost moves fastest). This must be deterministic.
+#[test]
+fn test_default_product_preserves_definition_order() {
+    let template = r#"{
+        "specificationVersion": "jobtemplate-2023-09",
+        "name": "Job",
+        "steps": [{"name": "step", "script": {"actions": {"onRun": {"command": "echo"}}},
+            "parameterSpace": {"taskParameterDefinitions": [
+                {"name": "A", "type": "INT", "range": [1, 2]},
+                {"name": "B", "type": "STRING", "range": ["x", "y"]},
+                {"name": "C", "type": "INT", "range": [10, 20]}
+            ]}
+        }]
+    }"#;
+    let tasks = create_and_iterate(template, &[]);
+    // 2 * 2 * 2 = 8 tasks. A is slowest, C is fastest.
+    assert_eq!(tasks.len(), 8);
+    // First 4 tasks have A=1, last 4 have A=2
+    assert_eq!(task_val_str(&tasks, 0, "A"), "1");
+    assert_eq!(task_val_str(&tasks, 4, "A"), "2");
+    // Within each A group, first 2 have B=x, next 2 have B=y
+    assert_eq!(task_val_str(&tasks, 0, "B"), "x");
+    assert_eq!(task_val_str(&tasks, 2, "B"), "y");
+    // C alternates fastest
+    assert_eq!(task_val_str(&tasks, 0, "C"), "10");
+    assert_eq!(task_val_str(&tasks, 1, "C"), "20");
+
+    // Verify full sequence is deterministic across repeated constructions
+    let expected: Vec<String> = tasks.iter().enumerate().map(|(i, _)| {
+        format!("{},{},{}", task_val_str(&tasks, i, "A"), task_val_str(&tasks, i, "B"), task_val_str(&tasks, i, "C"))
+    }).collect();
+    for _ in 0..20 {
+        let run = create_and_iterate(template, &[]);
+        let actual: Vec<String> = run.iter().enumerate().map(|(i, _)| {
+            format!("{},{},{}", task_val_str(&run, i, "A"), task_val_str(&run, i, "B"), task_val_str(&run, i, "C"))
+        }).collect();
+        assert_eq!(expected, actual, "Iteration order must be deterministic");
+    }
+}

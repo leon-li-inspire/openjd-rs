@@ -1,0 +1,77 @@
+#!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+set -eux
+
+# Run this from the root of the repository
+if ! test -f Cargo.toml
+then
+    echo "Must run from the root of the repository"
+    exit 1
+fi
+
+USE_LDAP="False"
+BUILD_ONLY="False"
+while [[ "${1:-}" != "" ]]; do
+    case $1 in
+        -h|--help)
+            echo "Usage: run_cross_user_tests.sh [--ldap] [--build-only]"
+            exit 1
+            ;;
+        --ldap)
+            echo "Using the LDAP client container image for testing."
+            USE_LDAP="True"
+            ;;
+        --build-only)
+            BUILD_ONLY="True"
+            ;;
+        *)
+            echo "Unrecognized parameter: $1"
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if test "${USE_LDAP}" == "True"; then
+    CONTAINER_HOSTNAME=ldap.environment.internal
+    CONTAINER_IMAGE_TAG="openjd_rs_ldap_test"
+    CONTAINER_IMAGE_DIR="ldap_sudo_environment"
+else
+    CONTAINER_HOSTNAME=localuser.environment.internal
+    CONTAINER_IMAGE_TAG="openjd_rs_localuser_test"
+    CONTAINER_IMAGE_DIR="localuser_sudo_environment"
+fi
+
+ARGS="-h ${CONTAINER_HOSTNAME}"
+
+docker build -t "${CONTAINER_IMAGE_TAG}" --build-arg "BUILDKIT_SANDBOX_HOSTNAME=${CONTAINER_HOSTNAME}" --ulimit nofile=1024 --file "testing_containers/${CONTAINER_IMAGE_DIR}/Dockerfile" .
+
+if test "${BUILD_ONLY}" == "True"; then
+    exit 0
+fi
+
+docker run --name test_openjd_rs_sudo --rm ${ARGS} "${CONTAINER_IMAGE_TAG}:latest"
+
+if test "${USE_LDAP}" != "True"; then
+    # Run capability tests
+    # First with CAP_KILL in effective and permitted capability sets
+    docker run --name test_openjd_rs_sudo --user root --rm ${ARGS} "${CONTAINER_IMAGE_TAG}:latest" \
+        capsh \
+            --caps='cap_setuid,cap_setgid,cap_setpcap=ep cap_kill=eip' \
+            --keep=1 \
+            --user=hostuser \
+            --addamb=cap_kill \
+            -- \
+                -c 'capsh --noamb --caps=cap_kill=ep -- -c "cargo test -p openjd-sessions --features test-utils -- --ignored test_cross_user_cap_kill"'
+    # Second with CAP_KILL in permitted capability set but not effective capability set
+    # this tests that OpenJD will add CAP_KILL to the effective capability set if needed
+    docker run --name test_openjd_rs_sudo --user root --rm ${ARGS} "${CONTAINER_IMAGE_TAG}:latest" \
+        capsh \
+            --caps='cap_setuid,cap_setgid,cap_setpcap=ep cap_kill=eip' \
+            --keep=1 \
+            --user=hostuser \
+            --addamb=cap_kill \
+            -- \
+                -c 'capsh --noamb --caps=cap_kill=p -- -c "cargo test -p openjd-sessions --features test-utils -- --ignored test_cross_user_cap_kill"'
+fi

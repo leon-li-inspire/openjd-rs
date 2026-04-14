@@ -1,0 +1,333 @@
+# Session State Machine
+
+## Overview
+
+The `Session` struct in `session.rs` is the central type of the crate. It manages the
+full lifecycle of an OpenJD session: creating a working directory, entering/exiting
+environments, running tasks, tracking environment variable changes, and cleaning up.
+
+## SessionState
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Ready,        // Can start any action
+    Running,      // An action is in progress
+    Canceling,    // Cancel requested, waiting for subprocess to exit
+    ReadyEnding,  // Failed/canceled — only exit_environment allowed
+    Ended,        // cleanup() called, session is done
+}
+```
+
+### Transitions
+
+```
+Ready ──────────► Running         (enter_environment / exit_environment / run_task / run_subprocess)
+Running ────────► Ready           (action succeeded, session not in ending-only mode)
+Running ────────► ReadyEnding     (action failed/canceled, OR session is in ending-only mode)
+Running ────────► Canceling       (cancel_action called)
+Canceling ──────► Ready           (canceled action completes, session not ending)
+Canceling ──────► ReadyEnding     (canceled action completes, session is ending)
+ReadyEnding ───► Running          (exit_environment started)
+Ready ──────────► Ended           (cleanup)
+ReadyEnding ───► Ended            (cleanup)
+```
+
+### Brittle Sessions
+
+After any action failure or cancelation, the session transitions to `ReadyEnding`. In
+this state, only `exit_environment()` and `cleanup()` are allowed. This prevents running
+new tasks or entering new environments after a failure, matching the Python library's
+behavior.
+
+The `ending_only` flag is set when:
+- An action completes with `ActionState::Failed`, `Canceled`, or `Timeout`
+- `exit_environment()` is called without `keep_session_running` (the default)
+
+This design reflects the worker agent's pattern: after a task fails, the agent exits all
+environments in reverse order and cleans up. There's no recovery path.
+
+## SessionConfig
+
+```rust
+pub struct SessionConfig {
+    pub session_id: String,
+    pub job_parameter_values: JobParameterValues,
+    pub path_mapping_rules: Option<Vec<PathMappingRule>>,
+    pub retain_working_dir: bool,
+    pub callback: Option<Box<dyn Fn(&str, &ActionStatus) + Send + Sync>>,
+    pub os_env_vars: Option<HashMap<String, String>>,
+    pub session_root_directory: Option<PathBuf>,
+    pub user: Option<Arc<dyn SessionUser>>,
+    pub revision_extensions: Option<ValidationContext>,
+    pub cancel_token: Option<CancellationToken>,
+}
+```
+
+### Why `session_root_directory` instead of `working_directory`
+
+The Python library accepts `session_root_directory` and creates the actual working
+directory internally via `TempDir`. This is important because:
+
+1. The session needs to control the directory name (random hex suffix for uniqueness)
+2. The session needs to set permissions (0o700, or 0o770 for cross-user)
+3. The session creates both a working directory and a files subdirectory within it
+
+Accepting a pre-created directory would require the caller to know these details.
+
+### Why `callback` is `Option<Box<dyn Fn>>` not a trait
+
+The Python library uses `Callable[[str, ActionStatus], None]`. A boxed closure is the
+closest Rust equivalent and avoids forcing consumers to define a named type. The callback
+must be `Send + Sync` because it's invoked from the async task processing `ActionMessage`
+values.
+
+The callback fires on:
+- Action start (state = Running)
+- Every `openjd_*` directive (progress, status, fail)
+- Action completion (state = Success/Failed/Canceled/Timeout)
+
+The worker agent uses this to forward real-time progress to the Deadline service. The
+callback must be fast — it runs inline with stdout processing, so delays block message
+delivery.
+
+### Why `cancel_token` is `Option<CancellationToken>`
+
+The optional `cancel_token` provides external cancellation support. When provided, all
+action cancel tokens are created as children of this token via `parent.child_token()`.
+Canceling the parent cascades to all current and future actions in the session.
+
+This enables the worker agent to cancel an entire session from outside the session's
+async context (e.g., when the Deadline service sends a cancel request). Without this,
+the agent would need to track and cancel each action individually.
+
+## Session Construction
+
+`Session::with_config(config: SessionConfig) -> Result<Self, SessionError>`:
+
+1. Creates the session root directory via `custom_gettempdir()` if not provided
+2. Creates the working directory via `TempDir::new()` with the session user for
+   cross-user permissions
+3. Creates the files subdirectory within the working directory
+4. Validates sticky bit on parent directories (POSIX security check)
+5. Logs host info (version, platform, architecture)
+6. Stores job parameter values, path mapping rules, and other config for later use
+
+A `Session::new(working_directory)` constructor exists behind the `test-utils` feature
+flag for tests that need to control the directory directly.
+
+## Environment Management
+
+### Enter
+
+`enter_environment(env, identifier, os_env_vars, resolved_bindings)`:
+
+1. Validates state is `Ready`
+2. Sets state to `Running`
+3. Resolves environment `variables` format strings against the current symbol table
+4. Pushes the environment onto `environments_entered` (LIFO stack)
+5. Creates an `EnvironmentScriptRunner` and calls `enter()` (runs `onEnter` action)
+6. Processes `ActionMessage` values via `drive_action()` — env var changes from
+   `openjd_env`/`openjd_unset_env` are applied to the environment's change set
+7. On success: state → `Ready` (or `ReadyEnding` if `ending_only`)
+8. On failure: state → `ReadyEnding`
+
+### Exit
+
+`exit_environment(identifier, os_env_vars, keep_session_running)`:
+
+1. Validates state is `Ready` or `ReadyEnding`
+2. Validates the identifier matches the most recently entered environment (LIFO order)
+3. Sets `ending_only = true` unless `keep_session_running` is true
+4. Runs `onExit` action via `EnvironmentScriptRunner::exit()`
+5. Pops the environment from `environments_entered`
+6. Removes the environment's variable changes from the cumulative set
+
+### Why LIFO enforcement
+
+Environments represent nested scopes — a step environment entered after a job environment
+depends on the job environment's variables. Exiting out of order would leave the session
+in an inconsistent state. The Python library enforces this, and the Rust crate matches.
+
+## Task Execution
+
+`run_task(step_script, task_parameter_values, os_env_vars, resolved_bindings)`:
+
+1. Validates state is `Ready`
+2. Sets state to `Running`
+3. Adds `Task.Param.*` and `Task.RawParam.*` to the symbol table
+4. Creates a `StepScriptRunner` and calls `run()` (runs `onRun` action)
+5. Processes `ActionMessage` values via `drive_action()`
+6. On completion: state → `Ready` or `ReadyEnding` based on result
+
+## Ad-hoc Subprocess
+
+```rust
+pub async fn run_subprocess(
+    &mut self,
+    command: &str,
+    args: Option<&[String]>,
+    timeout: Option<Duration>,
+    os_env_vars: Option<&HashMap<String, String>>,
+    use_session_env_vars: bool,
+    log_banner_message: Option<&str>,
+) -> Result<SubprocessResult, SessionError>
+```
+
+Runs an arbitrary command within the session context without format string resolution,
+embedded file materialization, or path mapping. Used by the worker agent for host
+configuration scripts (install, sync, etc.).
+
+### Validation
+
+- State must be `Ready` (returns `InvalidState` otherwise)
+- `command` must be non-empty (returns `Runtime` error)
+- `timeout`, if provided, must be positive (returns `Runtime` error)
+
+### Environment variable handling
+
+The `use_session_env_vars` flag controls which env vars the subprocess inherits:
+
+- `true`: Full session env vars — process env + `SessionConfig.os_env_vars` + per-action
+  `os_env_vars` + cumulative `openjd_env`/`openjd_unset_env` changes from entered
+  environments. This is the same env var set that `run_task` uses.
+- `false`: Minimal env vars — only process env + `SessionConfig.os_env_vars` + per-action
+  `os_env_vars`. No environment script changes are included.
+
+### Cancelation
+
+Always uses `CancelMethod::Terminate` (immediate SIGKILL). There is no
+`NotifyThenTerminate` option for ad-hoc subprocesses.
+
+### Cross-user routing
+
+When a cross-user helper is active, `run_subprocess` routes through
+`run_subprocess_via_helper` instead of spawning a new process directly. This avoids
+the per-action `sudo -i` overhead.
+
+### Differences from run_task
+
+| Aspect | `run_task` | `run_subprocess` |
+|--------|-----------|-----------------|
+| Format strings | Resolved | Not resolved |
+| Embedded files | Materialized | Not materialized |
+| Path mapping | Materialized to JSON | Not materialized |
+| Let bindings | Evaluated | Not evaluated |
+| Cancel method | From action template | Always `Terminate` |
+| State after failure | `ReadyEnding` | `ReadyEnding` |
+
+## Path Mapping Rules
+
+### extend_path_mapping_rules
+
+```rust
+pub fn extend_path_mapping_rules(&mut self, additional: Vec<PathMappingRule>)
+```
+
+Appends additional path mapping rules to the session's existing rules. Rules are
+re-sorted by source path length (longest first) after extending, ensuring that more
+specific rules take precedence over shorter ones.
+
+Used by the worker agent when additional path mapping rules become available after
+session creation (e.g., from job attachment manifests).
+
+## Symbol Table Construction
+
+`build_symbol_table()` populates a `SymbolTable` with:
+
+| Symbol | Value | Source |
+|--------|-------|--------|
+| `Session.WorkingDirectory` | Working dir path (path-mapped) | Session creation |
+| `Session.HasPathMappingRules` | `"true"` or `"false"` (bool with EXPR) | Path mapping config |
+| `Session.PathMappingRulesFile` | Path to JSON rules file | `materialize_path_mapping()` |
+| `Param.<name>` | Job parameter value (path-mapped for PATH types) | `SessionConfig.job_parameter_values` |
+| `RawParam.<name>` | Job parameter value (no path mapping) | `SessionConfig.job_parameter_values` |
+| `Task.Param.<name>` | Task parameter value (path-mapped) | `run_task()` call |
+| `Task.RawParam.<name>` | Task parameter value (no path mapping) | `run_task()` call |
+
+PATH-type parameters have path mapping rules applied. LIST_PATH parameters have rules
+applied to each element. Values are stored as `ExprValue` (typed) when the EXPR extension
+is active, or as strings for the base spec.
+
+## Path Mapping Materialization
+
+`materialize_path_mapping()` writes the path mapping rules to a JSON file in the working
+directory using the `pathmapping-1.0` format. This file is referenced by
+`Session.PathMappingRulesFile` in the symbol table, allowing actions to read and apply
+path mapping rules themselves.
+
+## Environment Variable Evaluation
+
+`evaluate_env_vars()` computes the cumulative environment variable map:
+
+1. Start with the process environment (`std::env::vars()`)
+2. Apply `SessionConfig.os_env_vars` overrides
+3. Apply per-action `os_env_vars` overrides
+4. For each entered environment (in entry order):
+   - Apply `set` changes (from environment `variables` + `openjd_env` directives)
+   - Apply `unset` changes (from `openjd_unset_env` directives)
+
+Unset takes precedence over set within the same environment, matching the spec.
+
+## Cancelation
+
+`cancel_action(time_limit, mark_action_failed)`:
+
+1. Validates state is `Running`
+2. Sets state to `Canceling`
+3. Cancels the `CancellationToken` — the subprocess loop responds by sending the
+   appropriate signal (SIGTERM for notify-then-terminate, SIGKILL for terminate)
+4. If `mark_action_failed` is true, the action result is `Failed` instead of `Canceled`
+
+The `time_limit` parameter sets a deadline for the cancelation to complete. If the
+subprocess doesn't exit within the limit, it's forcefully killed.
+
+## Cleanup
+
+`cleanup()`:
+
+1. For cross-user sessions: runs `sudo rm -rf` as the session user to clean files
+   owned by that user, then removes the directory as the process user
+2. For same-user sessions: `remove_dir_all` on the working directory
+3. Sets state to `Ended`
+4. Skips directory removal if `retain_working_dir` is true
+
+The `Drop` impl logs a warning if `cleanup()` wasn't called, but does not attempt
+cleanup itself — matching the Python library's explicit cleanup requirement.
+
+## drive_action
+
+`drive_action()` is the core async loop that runs an action to completion:
+
+```rust
+async fn drive_action(&mut self, action_future, message_rx) -> ActionResult {
+    tokio::pin!(action_future);
+    loop {
+        tokio::select! {
+            result = &mut action_future => { /* drain remaining messages, return */ }
+            Some(msg) = message_rx.recv() => { self.apply_message(msg); }
+        }
+    }
+}
+```
+
+This runs the subprocess future concurrently with message processing. When the subprocess
+exits, any remaining messages in the channel are drained before returning. The `&mut self`
+borrow is safe because the subprocess runs in a separate future — only the channel
+connects them.
+
+### apply_message
+
+Handles each `ActionMessage` variant:
+
+| Message | Effect |
+|---------|--------|
+| `Progress(v)` | Updates `action_status.progress` |
+| `Status(s)` | Updates `action_status.status_message` |
+| `Fail(s)` | Updates `action_status.fail_message` |
+| `SetEnv { name, value }` | Adds to current environment's change set |
+| `UnsetEnv { name }` | Adds unset to current environment's change set |
+| `RedactedEnv { name, value }` | Same as SetEnv + adds value to redaction set |
+| `CancelMarkFailed` | Sets `action_fail_message`, triggers cancelation with `mark_action_failed = true` |
+
+After each message, the user callback is invoked with the updated `ActionStatus`.

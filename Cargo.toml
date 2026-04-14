@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/openjd-expr",
+    "crates/openjd-model",
+    "crates/openjd-sessions",
+    "crates/openjd-cli",
+    "crates/openjd-snapshots",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/OpenJobDescription/openjd-rs"
+
+[workspace.dependencies]
+shlex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+regex = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"

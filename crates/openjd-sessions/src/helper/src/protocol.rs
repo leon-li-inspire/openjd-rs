@@ -1,0 +1,65 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::Write;
+
+/// A run-command request from the session.
+#[derive(Debug, Deserialize)]
+pub struct RunCommand {
+    pub command: String,
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub cwd: String,
+}
+
+/// Commands received on stdin from the session.
+#[derive(Debug)]
+pub enum Command {
+    Run(RunCommand),
+    Cancel(String),
+    Shutdown,
+}
+
+/// Responses sent on stdout to the session.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum Response {
+    Pid { pid: u32 },
+    Out { out: String },
+    Exited { exited: i32 },
+    Error { error: String },
+}
+
+impl<'de> Deserialize<'de> for Command {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match &value {
+            serde_json::Value::String(s) if s == "shutdown" => Ok(Command::Shutdown),
+            serde_json::Value::Object(map) => {
+                if map.contains_key("command") {
+                    let run: RunCommand = serde_json::from_value(value)
+                        .map_err(serde::de::Error::custom)?;
+                    Ok(Command::Run(run))
+                } else if let Some(sig) = map.get("cancel") {
+                    let sig = sig.as_str().unwrap_or("SIGTERM").to_string();
+                    Ok(Command::Cancel(sig))
+                } else {
+                    Err(serde::de::Error::custom("unknown command object"))
+                }
+            }
+            _ => Err(serde::de::Error::custom("expected object or \"shutdown\"")),
+        }
+    }
+}
+
+/// Write a JSON response line to stdout and flush.
+pub fn send(response: &Response) {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = serde_json::to_writer(&mut lock, response);
+    let _ = lock.write_all(b"\n");
+    let _ = lock.flush();
+}
